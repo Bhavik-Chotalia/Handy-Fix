@@ -24,6 +24,7 @@ const Profile: React.FC = () => {
   const [newPincode, setNewPincode] = useState('');
   const [allServices, setAllServices] = useState<any[]>([]);
   const [selectedServiceIds, setSelectedServiceIds] = useState<string[]>([]);
+  const [customPrices, setCustomPrices] = useState<Record<string, number>>({});
 
   const [form, setForm] = useState({
     full_name: '', phone: '', email: '', bio: '', experience_years: 0,
@@ -32,13 +33,29 @@ const Profile: React.FC = () => {
 
   // Load all available services from DB
   useEffect(() => {
-    supabase
+    (supabase as any)
       .from('services')
       .select('id, name, base_price, category')
       .eq('is_active', true)
       .order('name')
       .then(({ data }) => { if (data) setAllServices(data); });
   }, []);
+
+  // Load existing custom prices
+  useEffect(() => {
+    if (!provider?.id) return;
+    (supabase as any)
+      .from('provider_service_pricing')
+      .select('service_id, custom_price')
+      .eq('provider_id', provider.id)
+      .then(({ data }: { data: any[] | null }) => {
+        if (data) {
+          const priceMap: Record<string, number> = {};
+          data.forEach(p => { priceMap[p.service_id] = p.custom_price; });
+          setCustomPrices(priceMap);
+        }
+      });
+  }, [provider?.id]);
 
   // Sync form + selected services when provider loads
   useEffect(() => {
@@ -64,6 +81,16 @@ const Profile: React.FC = () => {
         ? prev.filter(id => id !== serviceId)
         : [...prev, serviceId]
     );
+  };
+
+  const saveCustomPrice = async (serviceId: string, price: number) => {
+    if (!provider?.id || !price) return;
+    await (supabase as any).from('provider_service_pricing').upsert({
+      provider_id: provider.id,
+      service_id: serviceId,
+      custom_price: price,
+      is_available: true,
+    }, { onConflict: 'provider_id,service_id' });
   };
 
   const handleSave = async () => {
@@ -92,7 +119,7 @@ const Profile: React.FC = () => {
       email: form.email,
       bio: form.bio,
       experience_years: Number(form.experience_years),
-      service_ids: selectedServiceIds,         // ← THE KEY SAVE
+      service_ids: selectedServiceIds,
       bank_account_name: form.bank_account_name || null,
       bank_account_number: form.bank_account_number || null,
       bank_ifsc: form.bank_ifsc || null,
@@ -102,10 +129,18 @@ const Profile: React.FC = () => {
 
     if (error) {
       toast({ title: 'Error', description: error.message, variant: 'destructive' });
-    } else {
-      toast({ title: 'Profile saved ✅', description: 'You are now discoverable in customer search for your selected services.' });
-      refreshProvider();
+      setSaving(false);
+      return;
     }
+
+    // Save custom prices for all selected services
+    for (const serviceId of selectedServiceIds) {
+      const price = customPrices[serviceId];
+      if (price) await saveCustomPrice(serviceId, price);
+    }
+
+    toast({ title: 'Profile saved ✅', description: 'Services, prices, and pincodes are now live.' });
+    refreshProvider();
     setSaving(false);
   };
 
@@ -203,34 +238,51 @@ const Profile: React.FC = () => {
               {allServices.map(service => {
                 const isSelected = selectedServiceIds.includes(service.id);
                 return (
-                  <button
+                  <div
                     key={service.id}
-                    type="button"
-                    onClick={() => toggleService(service.id)}
                     className={cn(
-                      'flex items-center gap-2 p-3 rounded-xl border text-left transition-all duration-200',
+                      'flex flex-col p-3 rounded-xl border text-left transition-all duration-200 cursor-pointer',
                       isSelected
                         ? 'border-primary/60 bg-primary/10 text-foreground'
                         : 'border-border bg-secondary/30 text-muted-foreground hover:border-primary/30 hover:bg-secondary/60'
                     )}
+                    onClick={() => toggleService(service.id)}
                   >
-                    <span className="text-lg shrink-0">
-                      {SERVICE_ICONS[service.name] || '🔧'}
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      <p className={cn('text-xs font-semibold truncate', isSelected ? 'text-foreground' : 'text-muted-foreground')}>
-                        {service.name}
-                      </p>
-                      <p className="text-[10px] text-muted-foreground">₹{service.base_price}</p>
+                    <div className="flex items-center gap-2">
+                      <span className="text-lg shrink-0">
+                        {SERVICE_ICONS[service.name] || '🔧'}
+                      </span>
+                      <div className="flex-1 min-w-0">
+                        <p className={cn('text-xs font-semibold truncate', isSelected ? 'text-foreground' : 'text-muted-foreground')}>
+                          {service.name}
+                        </p>
+                        <p className="text-[10px] text-muted-foreground">Base ₹{service.base_price}</p>
+                      </div>
+                      {isSelected && (
+                        <div className="w-4 h-4 rounded-full bg-primary flex items-center justify-center shrink-0">
+                          <svg className="w-2.5 h-2.5 text-primary-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                          </svg>
+                        </div>
+                      )}
                     </div>
+
+                    {/* Custom price input — only when selected */}
                     {isSelected && (
-                      <div className="w-4 h-4 rounded-full bg-primary flex items-center justify-center shrink-0">
-                        <svg className="w-2.5 h-2.5 text-primary-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                        </svg>
+                      <div className="mt-2 pt-2 border-t border-primary/20" onClick={e => e.stopPropagation()}>
+                        <p className="text-[9px] text-muted-foreground mb-1">Your price (₹)</p>
+                        <input
+                          type="number"
+                          value={customPrices[service.id] ?? service.base_price ?? ''}
+                          onChange={e => setCustomPrices(prev => ({ ...prev, [service.id]: Number(e.target.value) }))}
+                          onBlur={e => saveCustomPrice(service.id, Number(e.target.value))}
+                          className="w-full bg-background border border-primary/30 rounded-lg px-2 py-1 text-xs text-primary font-bold outline-none focus:border-primary"
+                          min={0}
+                          placeholder={`₹${service.base_price}`}
+                        />
                       </div>
                     )}
-                  </button>
+                  </div>
                 );
               })}
             </div>

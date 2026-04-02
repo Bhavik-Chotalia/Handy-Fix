@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { format } from "date-fns";
 import { CheckCircle2, Calendar, MapPin, User, Hash, Phone, ArrowRight, Home, MessageCircle, Star, Car } from "lucide-react";
 import { motion } from "framer-motion";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import Navbar from "@/components/Navbar";
 import Footer from "@/components/Footer";
 import BookingChat from "@/components/BookingChat";
@@ -21,14 +21,17 @@ type BookingDetails = {
   status: string | null;
   booking_date: string;
   booking_time: string;
+  scheduled_date?: string;
+  scheduled_time?: string;
   address: string;
   city: string | null;
   pincode: string;
   total_amount: number | null;
   provider_departed_at: string | null;
   provider_eta_minutes: number | null;
-  services: { name: string } | null;
-  service_providers: { name: string; rating: number | null; phone: string | null } | null;
+  cancellation_reason?: string | null;
+  services: { name: string; slug: string | null } | null;
+  service_providers: { full_name: string | null; name: string | null; rating: number | null; phone: string | null } | null;
 };
 
 function StarPicker({ value, onChange }: { value: number; onChange: (v: number) => void }) {
@@ -57,23 +60,65 @@ function StarPicker({ value, onChange }: { value: number; onChange: (v: number) 
 
 const BookingConfirmation = () => {
   const { bookingId } = useParams();
+  const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const { toast } = useToast();
   const { user } = useAuth();
+  // Auto-open chat when coming from ?chat=1 notification deep-link
+  const autoOpenChat = searchParams.get('chat') === '1';
   const [booking, setBooking] = useState<BookingDetails | null>(null);
   const [toastShown, setToastShown] = useState(false);
-  const [showChat, setShowChat] = useState(false);
+  const [showChat, setShowChat] = useState(autoOpenChat);
   const [showReview, setShowReview] = useState(false);
   const [reviewRating, setReviewRating] = useState(5);
   const [reviewComment, setReviewComment] = useState("");
   const [submittingReview, setSubmittingReview] = useState(false);
   const [hasReview, setHasReview] = useState(false);
 
+  // Status display config — Uber-style
+  const statusDisplay = {
+    pending: {
+      icon: '⏳',
+      iconBg: 'bg-warning/10 border-warning/30',
+      title: 'Request Sent!',
+      subtitle: 'Waiting for the provider to accept your booking...',
+      titleColor: 'text-foreground',
+    },
+    confirmed: {
+      icon: '✅',
+      iconBg: 'bg-green-500/10 border-green-500/30',
+      title: 'Booking Confirmed!',
+      subtitle: 'Your provider has accepted the booking.',
+      titleColor: 'text-green-400',
+    },
+    in_progress: {
+      icon: '🚀',
+      iconBg: 'bg-blue-500/10 border-blue-500/30',
+      title: 'Service In Progress',
+      subtitle: 'Your provider has started the work.',
+      titleColor: 'text-blue-400',
+    },
+    completed: {
+      icon: '🎉',
+      iconBg: 'bg-green-500/10 border-green-500/30',
+      title: 'Service Completed!',
+      subtitle: 'We hope you loved the service.',
+      titleColor: 'text-green-400',
+    },
+    cancelled: {
+      icon: '❌',
+      iconBg: 'bg-destructive/10 border-destructive/30',
+      title: 'Booking Not Confirmed',
+      subtitle: 'The provider could not accept this request.',
+      titleColor: 'text-destructive',
+    },
+  };
+
   const fetchBooking = async () => {
     if (!bookingId) return;
     const { data } = await (supabase as any)
       .from("bookings")
-      .select("id, status, booking_date, booking_time, address, city, pincode, total_amount, provider_id, provider_departed_at, provider_eta_minutes, services(name), service_providers(name, rating, phone)")
+      .select("id, status, booking_date, booking_time, scheduled_date, scheduled_time, address, city, pincode, total_amount, provider_id, provider_departed_at, provider_eta_minutes, cancellation_reason, services(name, slug), service_providers(full_name, name, rating, phone)")
       .eq("id", bookingId)
       .single();
     setBooking(data as BookingDetails | null);
@@ -128,10 +173,18 @@ const BookingConfirmation = () => {
 
   useEffect(() => {
     if (booking && !toastShown) {
-      toast({
-        title: "🎉 Booking Placed!",
-        description: `${booking.service_providers?.name} will confirm soon.`,
-      });
+      const status = booking.status ?? 'pending';
+      if (status === 'pending') {
+        toast({
+          title: "⏳ Request Sent!",
+          description: "Waiting for the provider to accept your booking.",
+        });
+      } else {
+        toast({
+          title: "🎉 Booking Placed!",
+          description: `${booking.service_providers?.full_name ?? booking.service_providers?.name ?? 'Provider'} will confirm soon.`,
+        });
+      }
       setToastShown(true);
     }
   }, [booking, toastShown, toast]);
@@ -142,14 +195,15 @@ const BookingConfirmation = () => {
   }, [booking?.id]);
 
   const status = booking?.status ?? "pending";
+  const display = statusDisplay[status as keyof typeof statusDisplay] ?? statusDisplay.pending;
 
   // Live timeline steps
   const steps = [
-    { label: "Booking Placed",      done: true },
-    { label: "Provider Confirmed",  done: ["confirmed", "in_progress", "completed"].includes(status) },
-    { label: "Provider On The Way", done: !!booking?.provider_departed_at, eta: booking?.provider_eta_minutes },
-    { label: "Service In Progress", done: ["in_progress", "completed"].includes(status) },
-    { label: "Completed ✅",        done: status === "completed" },
+    { label: "Request Sent",          done: true },
+    { label: "Provider Confirmed",   done: ["confirmed", "in_progress", "completed"].includes(status) },
+    { label: "Provider On The Way",  done: !!booking?.provider_departed_at, eta: booking?.provider_eta_minutes },
+    { label: "Service In Progress",  done: ["in_progress", "completed"].includes(status) },
+    { label: "Completed ✅",           done: status === "completed" },
   ];
 
   const submitReview = async () => {
@@ -191,26 +245,36 @@ const BookingConfirmation = () => {
         className="container mx-auto pt-28 pb-16 px-4"
       >
         <div className="max-w-2xl mx-auto space-y-6">
-          {/* Top card */}
+          {/* Top card — dynamic status */}
           <div className="bg-card border border-border rounded-2xl p-8 text-center relative overflow-hidden">
             <div className="absolute inset-0 overflow-hidden pointer-events-none">
-              <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-72 h-72 rounded-full bg-green-500/5 blur-3xl" />
+              <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-72 h-72 rounded-full bg-primary/5 blur-3xl" />
             </div>
             <motion.div
+              key={status}  /* re-animate when status changes */
               initial={{ scale: 0, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               transition={{ type: "spring", stiffness: 200, damping: 15, delay: 0.2 }}
-              className="mx-auto w-24 h-24 rounded-full bg-green-500/10 border-2 border-green-500/30 flex items-center justify-center mb-6"
+              className={`mx-auto w-24 h-24 rounded-full border-2 flex items-center justify-center mb-6 ${display.iconBg}`}
             >
-              <CheckCircle2 className="w-12 h-12 text-green-400" />
+              <span className="text-5xl">{display.icon}</span>
             </motion.div>
 
             <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.4 }}>
-              <h1 className="text-3xl font-bold text-foreground mb-2">Booking Placed! 🎉</h1>
-              <div className="inline-flex items-center gap-2 bg-secondary rounded-full px-4 py-1.5">
-                <Hash className="w-3.5 h-3.5 text-muted-foreground" />
-                <span className="text-sm font-mono text-muted-foreground">{formattedBookingId}</span>
-              </div>
+              <h1 className={`text-3xl font-bold mb-2 ${display.titleColor}`}>{display.title}</h1>
+              <p className="text-muted-foreground text-sm mb-3">{display.subtitle}</p>
+              {status !== 'pending' && (
+                <div className="inline-flex items-center gap-2 bg-secondary rounded-full px-4 py-1.5">
+                  <Hash className="w-3.5 h-3.5 text-muted-foreground" />
+                  <span className="text-sm font-mono text-muted-foreground">{formattedBookingId}</span>
+                </div>
+              )}
+              {status === 'pending' && (
+                <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground mt-2">
+                  <div className="w-2 h-2 rounded-full bg-warning animate-pulse" />
+                  Waiting for provider response...
+                </div>
+              )}
             </motion.div>
           </div>
 
@@ -260,11 +324,11 @@ const BookingConfirmation = () => {
             >
               <Avatar className="h-14 w-14">
                 <AvatarFallback className="bg-gradient-gold text-primary-foreground text-lg font-bold">
-                  {booking.service_providers.name[0]}
+                {(booking.service_providers?.full_name ?? booking.service_providers?.name ?? "P")[0]}
                 </AvatarFallback>
               </Avatar>
               <div className="flex-1">
-                <p className="font-bold text-foreground">{booking.service_providers.name}</p>
+                <p className="font-bold text-foreground">{booking.service_providers?.full_name ?? booking.service_providers?.name}</p>
                 {booking.service_providers.rating && (
                   <p className="text-sm text-yellow-400 flex items-center gap-1">
                     <Star className="w-3.5 h-3.5 fill-current" />
@@ -299,7 +363,7 @@ const BookingConfirmation = () => {
                 <div>
                   <p className="text-muted-foreground text-xs mb-0.5">Service</p>
                   <p className="font-medium text-foreground">{booking?.services?.name ?? "—"}</p>
-                  <p className="text-muted-foreground">{booking?.service_providers?.name}</p>
+                  <p className="text-muted-foreground">{booking?.service_providers?.full_name ?? booking?.service_providers?.name}</p>
                 </div>
               </div>
 
@@ -337,6 +401,24 @@ const BookingConfirmation = () => {
             )}
           </motion.div>
 
+          {/* Cancelled — retry card */}
+          {status === 'cancelled' && (
+            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.6 }}>
+              <div className="bg-card border border-destructive/20 rounded-2xl p-5 text-center">
+                <p className="text-muted-foreground text-sm mb-4">
+                  {booking?.cancellation_reason || 'The provider was unable to take this booking.'}{' '}
+                  You can book with another provider.
+                </p>
+                <Button
+                  className="bg-gradient-gold text-primary-foreground font-bold rounded-xl w-full"
+                  onClick={() => navigate(`/services/${booking?.services?.slug ?? ''}?pincode=${booking?.pincode ?? ''}`)}
+                >
+                  Find Another Provider →
+                </Button>
+              </div>
+            </motion.div>
+          )}
+
           {/* Chat button (when confirmed / in_progress) */}
           {["confirmed", "in_progress"].includes(status) && user && (
             <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.6 }}>
@@ -345,8 +427,9 @@ const BookingConfirmation = () => {
                 onClick={() => setShowChat(true)}
               >
                 <MessageCircle className="w-5 h-5 mr-2" />
-                Message {booking?.service_providers?.name}
+                Message {booking?.service_providers?.full_name ?? booking?.service_providers?.name}
               </Button>
+
             </motion.div>
           )}
 
@@ -397,7 +480,7 @@ const BookingConfirmation = () => {
             <DialogHeader className="p-4 pb-0 border-b border-border">
               <DialogTitle className="text-foreground flex items-center gap-2">
                 <MessageCircle className="w-5 h-5 text-primary" />
-                Chat with {booking?.service_providers?.name}
+                Chat with {booking?.service_providers?.full_name ?? booking?.service_providers?.name}
               </DialogTitle>
             </DialogHeader>
             <BookingChat
@@ -418,7 +501,7 @@ const BookingConfirmation = () => {
           <div className="space-y-5 pt-2">
             <div className="text-center">
               <p className="text-muted-foreground text-sm mb-3">
-                {booking?.services?.name} with {booking?.service_providers?.name}
+                {booking?.services?.name} with {booking?.service_providers?.full_name ?? booking?.service_providers?.name}
               </p>
               <StarPicker value={reviewRating} onChange={setReviewRating} />
               <p className="text-muted-foreground text-xs mt-2">

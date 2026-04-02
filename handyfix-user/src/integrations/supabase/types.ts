@@ -183,7 +183,7 @@ export type Database = {
       bookings: {
         Row: {
           id: string
-          user_id: string
+          customer_id: string
           provider_id: string | null
           service_id: string | null
           booking_date: string
@@ -194,13 +194,25 @@ export type Database = {
           special_instructions: string | null
           status: string | null
           total_amount: number | null
+          platform_fee: number | null
+          provider_amount: number | null
           payment_status: string | null
+          customer_name: string | null
+          customer_phone: string | null
+          cancelled_at: string | null
+          cancellation_reason: string | null
+          started_at: string | null
+          completed_at: string | null
+          provider_departed_at: string | null
+          provider_eta_minutes: number | null
+          unread_messages_customer: number | null
+          unread_messages_provider: number | null
           created_at: string
           updated_at: string
         }
         Insert: {
           id?: string
-          user_id: string
+          customer_id: string
           provider_id?: string | null
           service_id?: string | null
           booking_date: string
@@ -211,13 +223,25 @@ export type Database = {
           special_instructions?: string | null
           status?: string | null
           total_amount?: number | null
+          platform_fee?: number | null
+          provider_amount?: number | null
           payment_status?: string | null
+          customer_name?: string | null
+          customer_phone?: string | null
+          cancelled_at?: string | null
+          cancellation_reason?: string | null
+          started_at?: string | null
+          completed_at?: string | null
+          provider_departed_at?: string | null
+          provider_eta_minutes?: number | null
+          unread_messages_customer?: number | null
+          unread_messages_provider?: number | null
           created_at?: string
           updated_at?: string
         }
         Update: {
           id?: string
-          user_id?: string
+          customer_id?: string
           provider_id?: string | null
           service_id?: string | null
           booking_date?: string
@@ -228,7 +252,19 @@ export type Database = {
           special_instructions?: string | null
           status?: string | null
           total_amount?: number | null
+          platform_fee?: number | null
+          provider_amount?: number | null
           payment_status?: string | null
+          customer_name?: string | null
+          customer_phone?: string | null
+          cancelled_at?: string | null
+          cancellation_reason?: string | null
+          started_at?: string | null
+          completed_at?: string | null
+          provider_departed_at?: string | null
+          provider_eta_minutes?: number | null
+          unread_messages_customer?: number | null
+          unread_messages_provider?: number | null
           created_at?: string
           updated_at?: string
         }

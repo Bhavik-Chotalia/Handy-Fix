@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { format, isFuture, parseISO } from "date-fns";
 import { motion, AnimatePresence } from "framer-motion";
 import { useNavigate } from "react-router-dom";
 import Navbar from "@/components/Navbar";
@@ -14,45 +13,45 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { useAuth } from "@/contexts/AuthContext";
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
-import { getServiceIcon } from "@/lib/serviceIcons";
 import {
-  Star, Calendar, MapPin, Clock, User, XCircle, Package,
-  ChevronRight, Loader2, MessageCircle, Car
+  Star, Calendar, XCircle, Package, Loader2, MessageCircle, ChevronRight
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-type BookingRow = {
-  id: string;
-  status: string | null;
-  booking_date: string;
-  booking_time: string;
-  address: string;
-  city: string | null;
-  total_amount: number | null;
-  created_at: string | null;
-  service_id: string | null;
-  provider_id: string | null;
-  provider_departed_at: string | null;
-  provider_eta_minutes: number | null;
-  unread_messages_customer: number | null;
-  services: { name: string; icon_name: string | null } | null;
-  service_providers: { name: string; avatar_url: string | null; rating: number | null; phone: string | null } | null;
+const sb = supabase as any;
+
+// ── Notification → booking status mapping ──────────────────────────────────
+const NOTIF_STATUS: Record<string, string> = {
+  booking_confirmed:   "confirmed",
+  job_started:         "in_progress",
+  provider_on_the_way: "confirmed",
+  job_completed:       "completed",
+  booking_cancelled:   "cancelled",
 };
 
-const tabs = ["all", "upcoming", "completed", "cancelled"] as const;
+const STATUS_LABEL: Record<string, { label: string; cls: string; icon: string }> = {
+  pending:     { label: "Pending",     cls: "bg-yellow-500/20 text-yellow-400 border-yellow-500/30",  icon: "⏳" },
+  confirmed:   { label: "Confirmed",   cls: "bg-primary/20 text-primary border-primary/30",           icon: "✅" },
+  in_progress: { label: "In Progress", cls: "bg-blue-500/20 text-blue-400 border-blue-500/30",        icon: "🚀" },
+  completed:   { label: "Completed",   cls: "bg-green-500/20 text-green-400 border-green-500/30",     icon: "🎉" },
+  cancelled:   { label: "Cancelled",   cls: "bg-red-500/20 text-red-400 border-red-500/30",           icon: "❌" },
+};
 
-const statusClassMap: Record<string, string> = {
-  pending: "status-pending",
-  confirmed: "status-confirmed",
-  in_progress: "status-confirmed",
-  completed: "status-completed",
-  cancelled: "status-cancelled",
+type BookingCard = {
+  booking_id: string;
+  status: string;
+  service_name: string;
+  provider_name: string;
+  provider_id: string | null;
+  created_at: string;
+  has_chat: boolean;
+  has_review_prompt: boolean;
 };
 
 function StarPicker({ value, onChange }: { value: number; onChange: (v: number) => void }) {
   const [hovered, setHovered] = useState(0);
   return (
-    <div className="flex gap-1">
+    <div className="flex gap-1 justify-center">
       {[1, 2, 3, 4, 5].map((star) => (
         <button
           key={star}
@@ -64,9 +63,7 @@ function StarPicker({ value, onChange }: { value: number; onChange: (v: number) 
         >
           <Star
             className={`w-8 h-8 transition-colors ${
-              star <= (hovered || value)
-                ? "text-yellow-400 fill-current"
-                : "text-muted-foreground/30"
+              star <= (hovered || value) ? "text-yellow-400 fill-current" : "text-muted-foreground/30"
             }`}
           />
         </button>
@@ -75,135 +72,214 @@ function StarPicker({ value, onChange }: { value: number; onChange: (v: number) 
   );
 }
 
+function timeAgo(dateStr: string): string {
+  const diff = (Date.now() - new Date(dateStr).getTime()) / 1000;
+  if (diff < 60) return "Just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
+const tabs = ["all", "upcoming", "completed", "cancelled"] as const;
+
 const MyBookings = () => {
   const { user } = useAuth();
   const { toast } = useToast();
   const navigate = useNavigate();
 
-  const [bookings, setBookings] = useState<BookingRow[]>([]);
+  const [cards, setCards] = useState<BookingCard[]>([]);
   const [loading, setLoading] = useState(true);
-  const [cancellingId, setCancellingId] = useState<string | null>(null);
-  const [reviewOpen, setReviewOpen] = useState(false);
-  const [reviewBooking, setReviewBooking] = useState<BookingRow | null>(null);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [reviewBookingId, setReviewBookingId] = useState<string | null>(null);
+  const [reviewInfo, setReviewInfo] = useState<{ service: string; provider: string; provider_id: string | null } | null>(null);
   const [reviewRating, setReviewRating] = useState(5);
   const [reviewComment, setReviewComment] = useState("");
   const [submittingReview, setSubmittingReview] = useState(false);
-  const [activeChatBookingId, setActiveChatBookingId] = useState<string | null>(null);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
 
-  const loadBookings = async () => {
+  const buildCards = (notifs: any[]): BookingCard[] => {
+    // Group notifications by booking_id
+    const byBooking: Record<string, any[]> = {};
+    for (const n of notifs) {
+      if (!n.booking_id) continue;
+      if (!byBooking[n.booking_id]) byBooking[n.booking_id] = [];
+      byBooking[n.booking_id].push(n);
+    }
+
+    return Object.entries(byBooking).map(([booking_id, notifList]) => {
+      // Sort: newest last to get latest status
+      notifList.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+      const latest = notifList[notifList.length - 1];
+      const first = notifList[0];
+
+      // Derive status from latest notification type
+      let status = "pending";
+      for (const n of notifList) {
+        const s = NOTIF_STATUS[n.type];
+        if (s) status = s;
+      }
+
+      // Extract provider & service from data JSON or message text
+      const data = (latest.data || first.data || {}) as Record<string, any>;
+      let provider_name = data.provider_name || data.providerName || "Your Provider";
+      let service_name  = data.service_name  || data.serviceName  || "Home Service";
+      let provider_id   = data.provider_id   || data.providerId   || null;
+
+      // Fallback: parse from message string if data is empty
+      if (!data.provider_name) {
+        const msg = first.message || "";
+        const m = msg.match(/^(.+?) (accepted|started|completed|is on)/);
+        if (m) provider_name = m[1];
+      }
+
+      const has_chat = ["confirmed", "in_progress"].includes(status);
+      const has_review_prompt = status === "completed";
+
+      return {
+        booking_id,
+        status,
+        service_name,
+        provider_name,
+        provider_id,
+        created_at: first.created_at,
+        has_chat,
+        has_review_prompt,
+      };
+    }).sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  };
+
+  const loadData = async () => {
     if (!user) return;
-    const { data } = await (supabase as any)
+    setLoading(true);
+
+    // ── Strategy 1: Try direct booking query (works after SQL is run) ──────
+    const { data: direct } = await sb
       .from("bookings")
-      .select(
-        "id, status, booking_date, booking_time, address, city, total_amount, created_at, service_id, provider_id, provider_departed_at, provider_eta_minutes, unread_messages_customer, services(name, icon_name), service_providers(name, avatar_url, rating, phone)"
-      )
-      .eq("user_id", user.id)
+      .select("id, status, booking_date, booking_time, scheduled_date, address, city, total_amount, created_at, provider_id, services(name), service_providers(full_name, name)")
+      .eq("customer_id", user.id)
       .order("created_at", { ascending: false });
 
-    setBookings((data ?? []) as BookingRow[]);
+    if (direct && direct.length > 0) {
+      // Convert real bookings to card format
+      const realCards: BookingCard[] = direct.map((b: any) => ({
+        booking_id:        b.id,
+        status:            b.status ?? "pending",
+        service_name:      b.services?.name ?? "Home Service",
+        provider_name:     b.service_providers?.full_name ?? b.service_providers?.name ?? "Provider",
+        provider_id:       b.provider_id,
+        created_at:        b.created_at,
+        has_chat:          ["confirmed", "in_progress"].includes(b.status ?? ""),
+        has_review_prompt: b.status === "completed",
+      }));
+      setCards(realCards);
+      setLoading(false);
+      return;
+    }
+
+    // ── Strategy 2: Build cards entirely from customer_notifications ────────
+    // customer_notifications has its own RLS (customers always read their own)
+    const { data: notifs } = await sb
+      .from("customer_notifications")
+      .select("id, type, title, message, booking_id, data, created_at")
+      .eq("user_id", user.id)
+      .not("booking_id", "is", null)
+      .order("created_at", { ascending: false });
+
+    if (notifs && notifs.length > 0) {
+      setCards(buildCards(notifs));
+    }
     setLoading(false);
   };
 
-  useEffect(() => { loadBookings(); }, [user]);
+  useEffect(() => { loadData(); }, [user]);
 
-  // Real-time subscription — provider status changes update LIVE
+  // Realtime — update status live
   useEffect(() => {
     if (!user) return;
-    const channel = supabase
-      .channel("my-bookings-live")
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "bookings", filter: `user_id=eq.${user.id}` },
-        (payload) => {
-          const updated = payload.new as BookingRow;
-          // Show contextual toast based on what changed
-          if (updated.status === "confirmed") {
-            toast({ title: "✅ Booking Confirmed!", description: "Your provider has accepted the booking." });
-          } else if (updated.status === "in_progress") {
-            toast({ title: "🚀 Pro Has Arrived!", description: "Your service is now in progress." });
-          } else if (updated.status === "completed") {
-            toast({ title: "✅ Service Completed!", description: "Please leave a review for your provider." });
-          } else if (updated.status === "cancelled") {
-            toast({ title: "Booking Cancelled", description: "Your booking was cancelled.", variant: "destructive" });
-          }
-          // Check for "on the way"
-          if (updated.provider_departed_at && !bookings.find(b => b.id === updated.id)?.provider_departed_at) {
-            toast({
-              title: "🚗 Provider is on the way!",
-              description: updated.provider_eta_minutes ? `ETA ~${updated.provider_eta_minutes} minutes` : "They're heading to you now.",
-            });
-          }
-          loadBookings();
-        }
-      )
+    const channel = sb
+      .channel("my-bookings-notifs")
+      .on("postgres_changes", {
+        event: "INSERT",
+        schema: "public",
+        table: "customer_notifications",
+        filter: `user_id=eq.${user.id}`,
+      }, (payload: any) => {
+        const n = payload.new;
+        const s = NOTIF_STATUS[n.type];
+        if (s === "confirmed") toast({ title: "✅ Booking Confirmed!", description: "Your provider accepted the booking." });
+        else if (s === "in_progress") toast({ title: "🚀 Service Started!", description: "Your provider has arrived." });
+        else if (s === "completed") toast({ title: "🎉 Service Completed!", description: "Please leave a review." });
+        loadData();
+      })
       .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
-  }, [user, bookings]);
-
-  const grouped = useMemo(() => ({
-    all: bookings,
-    upcoming: bookings.filter((b) => {
-      const s = b.status ?? "";
-      return ["pending", "confirmed", "in_progress"].includes(s) && isFuture(parseISO(b.booking_date));
-    }),
-    completed: bookings.filter((b) => b.status === "completed"),
-    cancelled: bookings.filter((b) => b.status === "cancelled"),
-  }), [bookings]);
+    return () => { sb.removeChannel(channel); };
+  }, [user]);
 
   const cancelBooking = async (bookingId: string) => {
     setCancellingId(bookingId);
-    const { error } = await (supabase as any).from("bookings").update({
+    const { error } = await sb.from("bookings").update({
       status: "cancelled",
       cancellation_reason: "Cancelled by customer",
       cancelled_at: new Date().toISOString(),
     }).eq("id", bookingId);
     setCancellingId(null);
     if (error) {
-      toast({ title: "Error", description: error.message, variant: "destructive" });
+      toast({ title: "Error cancelling", description: error.message, variant: "destructive" });
       return;
     }
-    toast({ title: "Booking cancelled", description: "Refund will be processed in 5–7 days." });
-    loadBookings();
+    toast({ title: "Booking cancelled" });
+    setCards(prev => prev.map(c => c.booking_id === bookingId ? { ...c, status: "cancelled" } : c));
+  };
+
+  const openReview = (card: BookingCard) => {
+    setReviewBookingId(card.booking_id);
+    setReviewInfo({ service: card.service_name, provider: card.provider_name, provider_id: card.provider_id });
+    setReviewRating(5);
+    setReviewComment("");
   };
 
   const submitReview = async () => {
-    if (!user || !reviewBooking) return;
+    if (!user || !reviewBookingId) return;
     setSubmittingReview(true);
 
-    const { data: profile } = await supabase
-      .from("profiles")
-      .select("display_name")
-      .eq("id", user.id)
-      .single();
+    const { data: profile } = await sb.from("profiles").select("display_name").eq("id", user.id).single();
 
-    const { error } = await supabase.from("reviews").insert({
-      booking_id: reviewBooking.id,
-      user_id: user.id,
-      provider_id: reviewBooking.provider_id,
-      service_id: reviewBooking.service_id,
-      rating: reviewRating,
-      comment: reviewComment,
+    // Try to get provider_id if we don't have it
+    let pid = reviewInfo?.provider_id;
+    if (!pid) {
+      const { data: bk } = await sb.from("bookings").select("provider_id").eq("id", reviewBookingId).single();
+      pid = bk?.provider_id ?? null;
+    }
+
+    const { error } = await sb.from("reviews").insert({
+      booking_id:    reviewBookingId,
+      customer_id:   user.id,
+      provider_id:   pid,
+      rating:        reviewRating,
+      comment:       reviewComment,
       reviewer_name: profile?.display_name || user.email,
     });
+
     setSubmittingReview(false);
     if (error) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
       return;
     }
     toast({ title: "Review submitted! ⭐", description: "Thanks for your feedback." });
-    setReviewOpen(false);
-    setReviewComment("");
-    setReviewRating(5);
-    setReviewBooking(null);
+    setReviewBookingId(null);
+    setReviewInfo(null);
+    // Mark reviewed
+    setCards(prev => prev.map(c => c.booking_id === reviewBookingId ? { ...c, has_review_prompt: false } : c));
   };
 
-  const tabLabels: Record<string, string> = {
-    all: "All",
-    upcoming: "Upcoming",
-    completed: "Completed",
-    cancelled: "Cancelled",
-  };
+  const grouped = useMemo(() => ({
+    all:       cards,
+    upcoming:  cards.filter(c => ["pending", "confirmed", "in_progress"].includes(c.status)),
+    completed: cards.filter(c => c.status === "completed"),
+    cancelled: cards.filter(c => c.status === "cancelled"),
+  }), [cards]);
+
+  const tabLabels: Record<string, string> = { all: "All", upcoming: "Upcoming", completed: "Completed", cancelled: "Cancelled" };
 
   return (
     <div className="min-h-screen bg-background">
@@ -218,17 +294,14 @@ const MyBookings = () => {
             <h1 className="text-3xl font-bold text-foreground">My Bookings</h1>
             <p className="text-muted-foreground mt-1">Manage and track all your service bookings</p>
           </div>
-          <Button
-            onClick={() => navigate("/services")}
-            className="bg-gradient-gold text-primary-foreground font-semibold hover:opacity-90"
-          >
+          <Button onClick={() => navigate("/services")} className="bg-gradient-gold text-primary-foreground font-semibold hover:opacity-90">
             Book a Service
           </Button>
         </div>
 
         <Tabs defaultValue="all">
           <TabsList className="mb-6 bg-secondary p-1">
-            {tabs.map((tab) => (
+            {tabs.map(tab => (
               <TabsTrigger
                 key={tab}
                 value={tab}
@@ -244,19 +317,18 @@ const MyBookings = () => {
             ))}
           </TabsList>
 
-          {tabs.map((tab) => (
+          {tabs.map(tab => (
             <TabsContent key={tab} value={tab}>
               <AnimatePresence mode="wait">
                 {loading ? (
                   <div className="space-y-4">
-                    {[1, 2, 3].map((i) => (
+                    {[1, 2].map(i => (
                       <div key={i} className="bg-card border border-border rounded-2xl p-5 animate-pulse">
                         <div className="flex gap-4">
                           <div className="w-12 h-12 rounded-xl bg-secondary flex-shrink-0" />
                           <div className="flex-1 space-y-2">
                             <div className="h-4 bg-secondary rounded w-1/3" />
                             <div className="h-3 bg-secondary rounded w-1/2" />
-                            <div className="h-3 bg-secondary rounded w-2/3" />
                           </div>
                         </div>
                       </div>
@@ -274,162 +346,110 @@ const MyBookings = () => {
                     <p className="text-muted-foreground text-sm mb-6">
                       {tab === "all" ? "You haven't made any bookings yet." : `No ${tab} bookings found.`}
                     </p>
-                    <Button
-                      onClick={() => navigate("/services")}
-                      className="bg-gradient-gold text-primary-foreground"
-                    >
+                    <Button onClick={() => navigate("/services")} className="bg-gradient-gold text-primary-foreground">
                       Explore Services
                     </Button>
                   </motion.div>
                 ) : (
-                  <motion.div
-                    key={tab}
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    className="space-y-4"
-                  >
-                    {grouped[tab].map((booking, i) => {
-                      const Icon = getServiceIcon(booking.services?.icon_name);
-                      const status = booking.status ?? "pending";
-                      const canCancel =
-                        ["pending", "confirmed"].includes(status) &&
-                        isFuture(parseISO(booking.booking_date));
-                      const canChat = ["confirmed", "in_progress"].includes(status);
-                      const unread = booking.unread_messages_customer ?? 0;
-                      const ref = `#HF-${booking.id.slice(0, 8).toUpperCase()}`;
+                  <motion.div key={tab} initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-4">
+                    {grouped[tab].map((card, i) => {
+                      const st = STATUS_LABEL[card.status] ?? STATUS_LABEL.pending;
+                      const ref = `#HF-${card.booking_id.slice(0, 8).toUpperCase()}`;
+                      const canCancel = ["pending", "confirmed"].includes(card.status);
 
                       return (
                         <motion.div
-                          key={booking.id}
+                          key={card.booking_id}
                           initial={{ opacity: 0, y: 16 }}
                           animate={{ opacity: 1, y: 0 }}
-                          transition={{ delay: i * 0.05 }}
+                          transition={{ delay: i * 0.06 }}
                           className="bg-card border border-border rounded-2xl p-5 hover:border-primary/20 transition-colors"
                         >
-                          {/* "On the way" banner */}
-                          {booking.provider_departed_at && status !== "completed" && status !== "cancelled" && (
-                            <div className="mb-3 flex items-center gap-2 bg-blue-500/10 border border-blue-500/20 rounded-xl px-4 py-2.5">
-                              <Car className="w-4 h-4 text-blue-400 flex-shrink-0" />
-                              <span className="text-blue-300 text-sm font-medium">
-                                Your provider is on the way!
-                                {booking.provider_eta_minutes && ` ETA ~${booking.provider_eta_minutes} mins`}
-                              </span>
-                            </div>
-                          )}
-
                           <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
-                            {/* Left — info */}
+                            {/* Left */}
                             <div className="flex gap-4">
-                              <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center flex-shrink-0">
-                                <Icon className="w-5 h-5 text-primary" />
+                              {/* Status icon circle */}
+                              <div className={cn("w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0 text-xl", st.cls.split(" ").filter(c => c.startsWith("bg")).join(" "))}>
+                                {st.icon}
                               </div>
                               <div>
                                 <div className="flex items-center gap-2 flex-wrap mb-1">
-                                  <p className="font-semibold text-foreground">{booking.services?.name}</p>
-                                  <Badge className={statusClassMap[status] ?? "status-pending"}>
-                                    {status.replace("_", " ")}
+                                  <p className="font-semibold text-foreground">{card.service_name}</p>
+                                  <Badge className={cn("text-xs border", st.cls)}>
+                                    {st.label}
                                   </Badge>
                                 </div>
+                                <p className="text-xs text-muted-foreground font-mono mb-2">{ref}</p>
 
-                                <p className="text-xs text-muted-foreground font-mono mb-1">{ref}</p>
-
+                                {/* Provider */}
                                 <div className="flex items-center gap-2 mb-2">
                                   <Avatar className="w-5 h-5">
                                     <AvatarFallback className="bg-gradient-gold text-primary-foreground text-[10px] font-bold">
-                                      {(booking.service_providers?.name ?? "P")[0]}
+                                      {card.provider_name[0].toUpperCase()}
                                     </AvatarFallback>
                                   </Avatar>
-                                  <span className="text-sm text-muted-foreground">
-                                    {booking.service_providers?.name}
-                                  </span>
-                                  {booking.service_providers?.rating && (
-                                    <span className="flex items-center gap-0.5 text-xs text-yellow-400">
-                                      <Star className="w-3 h-3 fill-current" />
-                                      {booking.service_providers.rating}
-                                    </span>
-                                  )}
+                                  <span className="text-sm text-muted-foreground">{card.provider_name}</span>
                                 </div>
 
-                                <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
-                                  <span className="flex items-center gap-1">
-                                    <Calendar className="w-3 h-3" />
-                                    {format(parseISO(booking.booking_date), "d MMM yyyy")}
-                                  </span>
-                                  <span className="flex items-center gap-1">
-                                    <Clock className="w-3 h-3" />
-                                    {booking.booking_time.slice(0, 5)}
-                                  </span>
-                                  <span className="flex items-center gap-1">
-                                    <MapPin className="w-3 h-3" />
-                                    {booking.address}, {booking.city}
-                                  </span>
+                                {/* Time */}
+                                <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                                  <Calendar className="w-3 h-3" />
+                                  <span>{timeAgo(card.created_at)}</span>
                                 </div>
                               </div>
                             </div>
 
-                            {/* Right — actions */}
-                            <div className="flex flex-col items-start md:items-end gap-3">
-                              {booking.total_amount && (
-                                <p className="text-primary font-bold">₹{booking.total_amount}</p>
-                              )}
+                            {/* Right actions */}
+                            <div className="flex flex-col items-start md:items-end gap-2">
                               <div className="flex flex-wrap gap-2">
-                                {booking.provider_id && (
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    className="border-border"
-                                    onClick={() => navigate(`/provider/${booking.provider_id}`)}
-                                  >
-                                    <User className="w-3 h-3 mr-1" /> Provider
-                                  </Button>
-                                )}
+                                {/* View booking confirmation */}
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="border-border text-muted-foreground hover:text-foreground"
+                                  onClick={() => navigate(`/booking-confirmation/${card.booking_id}`)}
+                                >
+                                  View Details
+                                </Button>
+
                                 {/* Chat button */}
-                                {canChat && (
+                                {card.has_chat && (
                                   <Button
                                     variant="outline"
                                     size="sm"
-                                    className={cn(
-                                      "border-primary/30 text-primary hover:bg-primary/10 relative",
-                                      unread > 0 && "border-primary bg-primary/10"
-                                    )}
-                                    onClick={() => setActiveChatBookingId(booking.id)}
+                                    className="border-primary/30 text-primary hover:bg-primary/10"
+                                    onClick={() => setActiveChatId(card.booking_id)}
                                   >
                                     <MessageCircle className="w-3 h-3 mr-1" /> Chat
-                                    {unread > 0 && (
-                                      <span className="absolute -top-1.5 -right-1.5 bg-primary text-primary-foreground text-[9px] font-bold rounded-full w-4 h-4 flex items-center justify-center">
-                                        {unread}
-                                      </span>
-                                    )}
                                   </Button>
                                 )}
+
+                                {/* Review button — completed */}
+                                {card.has_review_prompt && (
+                                  <Button
+                                    size="sm"
+                                    className="bg-gradient-gold text-primary-foreground font-semibold hover:opacity-90"
+                                    onClick={() => openReview(card)}
+                                  >
+                                    <Star className="w-3 h-3 mr-1" /> Leave Review
+                                  </Button>
+                                )}
+
+                                {/* Cancel */}
                                 {canCancel && (
                                   <Button
                                     variant="outline"
                                     size="sm"
                                     className="border-red-500/30 text-red-400 hover:bg-red-500/10"
-                                    onClick={() => cancelBooking(booking.id)}
-                                    disabled={cancellingId === booking.id}
+                                    onClick={() => cancelBooking(card.booking_id)}
+                                    disabled={cancellingId === card.booking_id}
                                   >
-                                    {cancellingId === booking.id ? (
+                                    {cancellingId === card.booking_id ? (
                                       <Loader2 className="w-3 h-3 animate-spin mr-1" />
                                     ) : (
                                       <XCircle className="w-3 h-3 mr-1" />
                                     )}
                                     Cancel
-                                  </Button>
-                                )}
-                                {status === "completed" && (
-                                  <Button
-                                    size="sm"
-                                    className="bg-gradient-gold text-primary-foreground font-semibold hover:opacity-90"
-                                    onClick={() => {
-                                      setReviewBooking(booking);
-                                      setReviewRating(5);
-                                      setReviewComment("");
-                                      setReviewOpen(true);
-                                    }}
-                                  >
-                                    <Star className="w-3 h-3 mr-1" /> Rate & Review
                                   </Button>
                                 )}
                               </div>
@@ -446,73 +466,62 @@ const MyBookings = () => {
         </Tabs>
       </motion.main>
 
-      {/* Review Dialog */}
-      <Dialog open={reviewOpen} onOpenChange={setReviewOpen}>
-        <DialogContent className="bg-card border-border max-w-md">
-          <DialogHeader>
-            <DialogTitle className="text-foreground">Rate your experience</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-5 pt-2">
-            <div className="text-center">
-              <p className="text-muted-foreground text-sm mb-1">
-                {reviewBooking?.services?.name} with {reviewBooking?.service_providers?.name}
-              </p>
-              <div className="flex justify-center mt-3">
-                <StarPicker value={reviewRating} onChange={setReviewRating} />
-              </div>
-              <p className="text-muted-foreground text-xs mt-2">
-                {["", "Poor", "Fair", "Good", "Great", "Excellent!"][reviewRating]}
-              </p>
-            </div>
-
-            <div>
-              <label className="text-sm text-muted-foreground block mb-1">
-                Comment (optional)
-              </label>
-              <Textarea
-                value={reviewComment}
-                onChange={(e) => setReviewComment(e.target.value)}
-                placeholder="Share your experience..."
-                className="bg-secondary border-border"
-                rows={3}
-              />
-            </div>
-
-            <Button
-              onClick={submitReview}
-              disabled={submittingReview}
-              className="w-full bg-gradient-gold text-primary-foreground font-bold hover:opacity-90"
-            >
-              {submittingReview ? (
-                <Loader2 className="w-4 h-4 animate-spin mr-2" />
-              ) : (
-                <ChevronRight className="w-4 h-4 mr-2" />
-              )}
-              {submittingReview ? "Submitting..." : "Submit Review"}
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      {/* Chat Dialog */}
-      {activeChatBookingId && user && (
-        <Dialog open={!!activeChatBookingId} onOpenChange={() => setActiveChatBookingId(null)}>
+      {/* ── Chat Dialog ─────────────────────────────────────────────── */}
+      {activeChatId && user && (
+        <Dialog open={!!activeChatId} onOpenChange={() => setActiveChatId(null)}>
           <DialogContent className="bg-card border-border p-0 max-w-md">
             <DialogHeader className="p-4 pb-0 border-b border-border">
               <DialogTitle className="text-foreground flex items-center gap-2">
                 <MessageCircle className="w-5 h-5 text-primary" />
-                Chat with{" "}
-                {bookings.find((b) => b.id === activeChatBookingId)?.service_providers?.name || "Provider"}
+                Chat with {cards.find(c => c.booking_id === activeChatId)?.provider_name ?? "Provider"}
               </DialogTitle>
             </DialogHeader>
-            <BookingChat
-              bookingId={activeChatBookingId}
-              currentUserId={user.id}
-              senderType="customer"
-            />
+            <BookingChat bookingId={activeChatId} currentUserId={user.id} senderType="customer" />
           </DialogContent>
         </Dialog>
       )}
+
+      {/* ── Review Dialog ────────────────────────────────────────────── */}
+      <Dialog open={!!reviewBookingId} onOpenChange={() => setReviewBookingId(null)}>
+        <DialogContent className="bg-card border-border max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-foreground">Rate your experience ⭐</DialogTitle>
+          </DialogHeader>
+          {reviewInfo && (
+            <div className="space-y-5 pt-2">
+              <div className="text-center">
+                <p className="text-muted-foreground text-sm">
+                  {reviewInfo.service} with <span className="text-foreground font-medium">{reviewInfo.provider}</span>
+                </p>
+                <div className="flex justify-center mt-4">
+                  <StarPicker value={reviewRating} onChange={setReviewRating} />
+                </div>
+                <p className="text-muted-foreground text-xs mt-2">
+                  {["", "Poor", "Fair", "Good", "Great", "Excellent!"][reviewRating]}
+                </p>
+              </div>
+              <div>
+                <label className="text-sm text-muted-foreground block mb-1">Comment (optional)</label>
+                <Textarea
+                  value={reviewComment}
+                  onChange={e => setReviewComment(e.target.value)}
+                  placeholder="Share your experience..."
+                  className="bg-secondary border-border"
+                  rows={3}
+                />
+              </div>
+              <Button
+                onClick={submitReview}
+                disabled={submittingReview}
+                className="w-full bg-gradient-gold text-primary-foreground font-bold hover:opacity-90"
+              >
+                {submittingReview ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <ChevronRight className="w-4 h-4 mr-2" />}
+                {submittingReview ? "Submitting..." : "Submit Review"}
+              </Button>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
 
       <Footer />
     </div>

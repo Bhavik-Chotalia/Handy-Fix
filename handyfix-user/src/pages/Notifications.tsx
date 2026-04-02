@@ -104,7 +104,23 @@ const CustomerNotifications = () => {
 
   const handleClick = async (notif: CustomerNotification) => {
     await markOneRead(notif.id);
-    if (notif.booking_id) navigate("/my-bookings");
+    if (!notif.booking_id) return;
+
+    // Route based on type for direct deep-links
+    switch (notif.type) {
+      case 'job_completed':
+      case 'review_reminder':
+        // Go to booking confirmation — review dialog is there
+        navigate(`/booking-confirmation/${notif.booking_id}`);
+        break;
+      case 'new_message':
+        // Go to booking confirmation — chat is available there
+        navigate(`/booking-confirmation/${notif.booking_id}?chat=1`);
+        break;
+      default:
+        // All other booking notifications → booking confirmation
+        navigate(`/booking-confirmation/${notif.booking_id}`);
+    }
   };
 
   const unreadCount = notifications.filter((n) => !n.is_read).length;
@@ -201,6 +217,34 @@ const CustomerNotifications = () => {
                     <p className="font-semibold text-foreground text-sm mb-0.5">{notif.title}</p>
                     <p className="text-muted-foreground text-sm line-clamp-2">{notif.message}</p>
                     <p className="text-muted-foreground text-xs mt-1">{timeAgo(notif.created_at)}</p>
+
+                    {/* Action buttons */}
+                    {notif.booking_id && (
+                      <div className="flex gap-2 mt-2" onClick={e => e.stopPropagation()}>
+                        {(notif.type === 'job_completed' || notif.type === 'review_reminder') && (
+                          <button
+                            onClick={() => navigate(`/booking-confirmation/${notif.booking_id}`)}
+                            className="text-xs bg-warning/10 border border-warning/30 text-warning font-semibold px-3 py-1 rounded-full hover:bg-warning/20 transition-colors"
+                          >
+                            ⭐ Leave Review
+                          </button>
+                        )}
+                        {notif.type === 'new_message' && (
+                          <button
+                            onClick={() => navigate(`/booking-confirmation/${notif.booking_id}?chat=1`)}
+                            className="text-xs bg-primary/10 border border-primary/30 text-primary font-semibold px-3 py-1 rounded-full hover:bg-primary/20 transition-colors"
+                          >
+                            💬 Open Chat
+                          </button>
+                        )}
+                        <button
+                          onClick={() => navigate(`/booking-confirmation/${notif.booking_id}`)}
+                          className="text-xs bg-secondary border border-border text-muted-foreground font-medium px-3 py-1 rounded-full hover:text-foreground transition-colors"
+                        >
+                          View Booking →
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </motion.div>
               );

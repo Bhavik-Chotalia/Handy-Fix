@@ -48,12 +48,13 @@ const Dashboard: React.FC = () => {
 
   const fetchPending = useCallback(async () => {
     if (!provider) return;
-    const { data } = await supabase
+    const { data } = await (supabase as any)
       .from('bookings')
-      .select('*, services(name, icon, duration_minutes), profiles!bookings_customer_id_fkey(full_name, phone)')
+      .select('*, services(name, icon_name, duration_minutes)')
+      // customer_name & customer_phone are now direct columns on bookings
       .eq('provider_id', provider.id)
       .eq('status', 'pending')
-      .order('scheduled_date', { ascending: true })
+      .order('created_at', { ascending: true })
       .limit(5);
     setPendingBookings(data || []);
   }, [provider]);
@@ -61,11 +62,11 @@ const Dashboard: React.FC = () => {
   const fetchTodayStats = useCallback(async () => {
     if (!provider) return;
     const today = new Date().toISOString().split('T')[0];
-    const { data: todayBookings } = await supabase
+    const { data: todayBookings } = await (supabase as any)
       .from('bookings')
       .select('total_amount')
       .eq('provider_id', provider.id)
-      .eq('scheduled_date', today)
+      .or(`booking_date.eq.${today},scheduled_date.eq.${today}`)
       .eq('status', 'completed');
     setTodayStats({
       jobs: todayBookings?.length || 0,

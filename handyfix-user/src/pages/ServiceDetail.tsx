@@ -24,7 +24,7 @@ type ServiceInfo = {
 
 type Provider = {
   id: string;
-  full_name: string;
+  full_name: string | null;
   avatar_url: string | null;
   bio: string | null;
   experience_years: number | null;
@@ -32,7 +32,8 @@ type Provider = {
   total_reviews: number | null;
   total_jobs: number | null;
   is_verified: boolean | null;
-  is_online: boolean | null;
+  is_online: boolean | null;    // alias shown in UI (mapped from is_available)
+  is_available: boolean | null; // DB actual column
   pincodes: string[] | null;
   service_ids: string[] | null;
 };
@@ -52,6 +53,8 @@ const ServiceDetail = () => {
   const [error, setError] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<SortOption>("rating");
   const [verifiedOnly, setVerifiedOnly] = useState(false);
+  const [subItems, setSubItems] = useState<any[]>([]);
+  const [selectedSubItem, setSelectedSubItem] = useState<any>(null);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -95,27 +98,51 @@ const ServiceDetail = () => {
         }
         setService(svcData);
 
-        // Step 2: Fetch providers using service_ids array — THE CORRECT QUERY
-        // Providers appear only if they:
-        //   - Have this service in service_ids (they selected it in Profile)
-        //   - Serve this pincode (they added it in Profile)
-        //   - Are online right now
-        //   - Have active status
-        const query = (supabase as any)
+        // Step 2: Fetch providers
+        // Fetch ALL providers first (so we can debug in console), then filter client-side.
+        // This avoids query failures from missing columns in the select string.
+        console.log("🔍 Fetching providers for service:", svcData.id, "pincode:", pincode);
+
+        const { data: allProviders, error: pvdErr } = await (supabase as any)
           .from("service_providers")
-          .select("id, full_name, bio, rating, total_reviews, total_jobs, experience_years, avatar_url, is_online, is_verified, pincodes, service_ids")
-          .contains("service_ids", [svcData.id])   // provider selected this service
-          .eq("is_online", true)
-          .eq("status", "active");
+          .select("*")   // select ALL columns — safest approach
+          .order("rating", { ascending: false });
 
-        // Only filter by pincode if one was provided
-        const finalQuery = pincode
-          ? query.contains("pincodes", [pincode])
-          : query;
+        if (pvdErr) {
+          console.error("❌ Provider query error:", pvdErr.message, pvdErr);
+          // Don't throw — just show empty state
+          setProviders([]);
+          setLoading(false);
+          return;
+        }
 
-        const { data: pvdData } = await finalQuery.order("rating", { ascending: false });
+        console.log("✅ All providers from DB:", allProviders);
 
-        setProviders(pvdData || []);
+        // Client-side filter step 1: by pincode (if provided)
+        const inPincode = pincode
+          ? (allProviders || []).filter((p: any) =>
+              Array.isArray(p.pincodes) && p.pincodes.includes(pincode)
+            )
+          : (allProviders || []);
+
+        console.log(`📍 Providers in pincode ${pincode}:`, inPincode);
+
+        // Client-side filter step 2: by service_ids (if the column exists and has data)
+        const filtered = inPincode.filter((p: any) => {
+          if (!p.service_ids || p.service_ids.length === 0) return true; // show if no services set
+          return p.service_ids.includes(svcData.id);
+        });
+
+        console.log("🎯 Providers after service filter:", filtered);
+
+        // Normalize column names for UI
+        const normalized = filtered.map((p: any) => ({
+          ...p,
+          full_name: p.full_name || p.name || "Provider",
+          is_online: p.is_available ?? p.is_online ?? true, // fallback to true
+        }));
+
+        setProviders(normalized);
       } catch {
         setError("Something went wrong. Please try again.");
       }
@@ -124,6 +151,20 @@ const ServiceDetail = () => {
 
     fetchData();
   }, [serviceSlug, pincode]);
+
+  // Fetch sub-items once service is loaded
+  useEffect(() => {
+    if (!service?.id) return;
+    (supabase as any)
+      .from('service_sub_items')
+      .select('*')
+      .eq('service_id', service.id)
+      .eq('is_active', true)
+      .order('sort_order')
+      .then(({ data }: { data: any[] | null }) => {
+        if (data) setSubItems(data);
+      });
+  }, [service?.id]);
 
   const sorted = [...providers]
     .filter((p) => !verifiedOnly || p.is_verified)
@@ -165,6 +206,55 @@ const ServiceDetail = () => {
               )}
             </div>
           </motion.div>
+        )}
+
+        {/* Sub-items selection — Urban Company style */}
+        {subItems.length > 0 && (
+          <div className="mb-8">
+            <h2 className="text-xl font-bold text-foreground mb-1">What do you need?</h2>
+            <p className="text-sm text-muted-foreground mb-4">Select the specific service you need</p>
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+              {subItems.map(item => (
+                <button
+                  key={item.id}
+                  onClick={() => setSelectedSubItem((prev: any) => prev?.id === item.id ? null : item)}
+                  className={`flex flex-col items-start p-4 rounded-2xl border text-left transition-all duration-200 ${
+                    selectedSubItem?.id === item.id
+                      ? 'border-primary/50 bg-primary/10 shadow-md'
+                      : 'border-border bg-card hover:border-primary/20'
+                  }`}
+                >
+                  <span className="text-2xl mb-2">{item.icon}</span>
+                  <p className={`font-semibold text-sm ${
+                    selectedSubItem?.id === item.id ? 'text-foreground' : 'text-muted-foreground'
+                  }`}>
+                    {item.name}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{item.description}</p>
+                  <p className="text-primary font-bold text-sm mt-2">₹{item.base_price}</p>
+                  <p className="text-xs text-muted-foreground">{item.duration_minutes} mins</p>
+                  {selectedSubItem?.id === item.id && (
+                    <span className="text-xs text-primary font-semibold mt-1">✓ Selected</span>
+                  )}
+                </button>
+              ))}
+            </div>
+            {selectedSubItem && (
+              <div className="mt-3 p-3 bg-primary/5 border border-primary/20 rounded-xl flex items-center gap-2">
+                <span className="text-lg">{selectedSubItem.icon}</span>
+                <p className="text-sm text-foreground font-medium">
+                  {selectedSubItem.name} · <span className="text-primary font-bold">₹{selectedSubItem.base_price}</span>
+                  <span className="text-xs text-muted-foreground ml-2">{selectedSubItem.duration_minutes} mins</span>
+                </p>
+                <button
+                  onClick={() => setSelectedSubItem(null)}
+                  className="ml-auto text-muted-foreground hover:text-foreground text-xs"
+                >
+                  ✕ Clear
+                </button>
+              </div>
+            )}
+          </div>
         )}
 
         {/* Sort & filter bar */}
@@ -310,17 +400,25 @@ const ServiceDetail = () => {
 
                   <div className="flex flex-col items-start md:items-end justify-between gap-3">
                     <div className="text-right">
-                      <p className="text-2xl font-bold text-primary">₹{service?.base_price}</p>
-                      <p className="text-xs text-muted-foreground">per visit</p>
+                      <p className="text-2xl font-bold text-primary">
+                        ₹{selectedSubItem ? selectedSubItem.base_price : service?.base_price}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {selectedSubItem ? selectedSubItem.name : 'per visit'}
+                      </p>
                     </div>
                     <div className="flex gap-2">
                       <Button
                         size="sm"
                         onClick={() => {
+                          const base = `/book/${serviceSlug}/${provider.id}?pincode=${pincode}`;
+                          const sub = selectedSubItem
+                            ? `&sub_item=${selectedSubItem.id}&sub_name=${encodeURIComponent(selectedSubItem.name)}&sub_price=${selectedSubItem.base_price}`
+                            : '';
                           if (!user) {
-                            navigate(`/auth?redirect=/book/${serviceSlug}/${provider.id}?pincode=${pincode}`);
+                            navigate(`/auth?redirect=${base}${sub}`);
                           } else {
-                            navigate(`/book/${serviceSlug}/${provider.id}?pincode=${pincode}`);
+                            navigate(`${base}${sub}`);
                           }
                         }}
                         className="bg-gradient-gold text-primary-foreground font-semibold hover:opacity-90 shadow-gold"

@@ -15,7 +15,7 @@ import { Tables } from "@/integrations/supabase/types";
 
 type Service = Tables<"services">;
 type Provider = Tables<"service_providers"> & {
-  provider_services: Array<{ custom_price: number | null }>;
+  provider_services?: Array<{ custom_price: number | null }>;
 };
 
 const slots = ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"];
@@ -24,6 +24,9 @@ const Booking = () => {
   const { serviceSlug, providerId } = useParams();
   const [searchParams] = useSearchParams();
   const pincodeFromQuery = searchParams.get("pincode") ?? "";
+  const subItemId = searchParams.get("sub_item") ?? null;
+  const subItemName = searchParams.get("sub_name") ?? null;
+  const subItemPrice = searchParams.get("sub_price") ? Number(searchParams.get("sub_price")) : null;
   const navigate = useNavigate();
   const { user } = useAuth();
   const { toast } = useToast();
@@ -44,13 +47,20 @@ const Booking = () => {
       if (!serviceSlug || !providerId || !user) return;
 
       const [{ data: serviceData }, { data: providerData }, { data: profileData }] = await Promise.all([
-        supabase.from("services").select("*").eq("slug", serviceSlug).single(),
-        supabase
+        // Simple slug query only — no UUID fallback (avoids 22P02 uuid parse error)
+        supabase.from("services")
+          .select("*")
+          .eq("slug", serviceSlug)
+          .maybeSingle(),
+        (supabase as any)
           .from("service_providers")
-          .select("*, provider_services!inner(custom_price)")
+          .select("*")          // no !inner join — loads even without provider_services rows
           .eq("id", providerId)
-          .single(),
-        supabase.from("profiles").select("address, city, pincode, display_name, phone").eq("id", user.id).single(),
+          .maybeSingle(),
+        supabase.from("profiles")
+          .select("address, city, pincode, display_name, phone")
+          .eq("id", user.id)
+          .maybeSingle(),
       ]);
 
       setService(serviceData);
@@ -67,58 +77,93 @@ const Booking = () => {
   }, [serviceSlug, providerId, user]);
 
   const serviceCharge = useMemo(() => {
-    if (!provider || !service) return 0;
-    return provider.provider_services[0]?.custom_price ?? provider.base_charge ?? service.base_price ?? 0;
-  }, [provider, service]);
+    if (subItemPrice) return subItemPrice;  // Use sub-item price if selected
+    if (!service) return 0;
+    return service.base_price ?? 0;
+  }, [service, subItemPrice]);
 
-  const platformFee = 49;
+  const platformFee = useMemo(() => Math.round(serviceCharge * 0.20), [serviceCharge]);
+  const providerAmount = serviceCharge - platformFee;
   const totalAmount = serviceCharge + platformFee;
 
   const canGoStep2 = Boolean(selectedDate && selectedTime);
   const canGoStep3 = Boolean(address.trim() && city.trim() && /^\d{6}$/.test(pincode));
 
   const confirmBooking = async () => {
-    if (!user || !service || !provider || !selectedDate || !selectedTime) return;
+    if (!user || !service || !selectedDate || !selectedTime || !providerId) return;
 
     setSaving(true);
 
-    const { data: booking, error } = await supabase
-      .from("bookings")
-      .insert({
-        user_id: user.id,
-        provider_id: provider.id,
-        service_id: service.id,
-        booking_date: format(selectedDate, "yyyy-MM-dd"),
-        booking_time: `${selectedTime}:00`,
+    try {
+      // Fetch customer profile for name + phone
+      const { data: profileData } = await supabase
+        .from("profiles")
+        .select("display_name, phone")
+        .eq("id", user.id)
+        .maybeSingle();
+
+      const formattedDate = format(selectedDate, "yyyy-MM-dd");
+      const formattedTime = `${selectedTime}:00`;
+      const customerName = profileData?.display_name || user.email?.split("@")[0] || "Customer";
+
+      const insertPayload: Record<string, unknown> = {
+        customer_id:          user.id,
+        provider_id:          providerId,
+        service_id:           service.id,
+        booking_date:         formattedDate,
+        booking_time:         formattedTime,
+        scheduled_date:       formattedDate,
+        scheduled_time:       formattedTime,
         address,
         pincode,
         city,
-        special_instructions: notes,
-        total_amount: totalAmount,
-        status: "pending",
-        customer_name: profileData?.display_name || user.email || null,
-        customer_phone: profileData?.phone || null,
-      })
-      .select("id")
-      .single();
+        special_instructions: notes || null,
+        description:          notes || null,
+        total_amount:         serviceCharge,
+        platform_fee:         platformFee,
+        provider_amount:      providerAmount,
+        status:               "pending",
+        customer_name:        customerName,
+        customer_phone:       profileData?.phone || null,
+        sub_item_id:          subItemId || null,
+        sub_item_name:        subItemName || null,
+      };
 
-    setSaving(false);
+      const { data: booking, error } = await (supabase as any)
+        .from("bookings")
+        .insert(insertPayload)
+        .select("id")
+        .single();
 
-    if (error) {
-      toast({ title: "Error", description: error.message, variant: "destructive" });
-      return;
+      if (error) {
+        console.error("Booking insert error:", error);
+        toast({
+          title: "Booking failed",
+          description: error.message,
+          variant: "destructive",
+        });
+        setSaving(false);
+        return;
+      }
+
+      sessionStorage.setItem(
+        "booking-toast",
+        JSON.stringify({
+          providerName: (provider as any)?.full_name ?? (provider as any)?.name ?? "Your Provider",
+          dateTime: `${format(selectedDate, "d MMMM")}, ${selectedTime}`,
+        }),
+      );
+
+      navigate(`/booking-confirmation/${booking.id}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "An unexpected error occurred";
+      console.error("Booking error:", err);
+      toast({ title: "Booking failed", description: msg, variant: "destructive" });
+    } finally {
+      setSaving(false);
     }
-
-    sessionStorage.setItem(
-      "booking-toast",
-      JSON.stringify({
-        providerName: provider.name,
-        dateTime: `${format(selectedDate, "d MMMM")}, ${selectedTime}`,
-      }),
-    );
-
-    navigate(`/booking-confirmation/${booking.id}`);
   };
+
 
   return (
     <div className="min-h-screen bg-background">
@@ -130,7 +175,7 @@ const Booking = () => {
       >
         <h1 className="text-3xl font-bold mb-1">Book Service</h1>
         <p className="text-muted-foreground mb-8">
-          {service?.name} · {provider?.name}
+          {service?.name} · {(provider as any)?.full_name ?? (provider as any)?.name}
         </p>
 
         <div className="bg-card border border-border rounded-2xl p-5 md:p-8">
@@ -230,8 +275,13 @@ const Booking = () => {
                 <p>
                   Service: <span className="text-foreground font-medium">{service?.name}</span>
                 </p>
+                {subItemName && (
+                  <p>
+                    Sub-service: <span className="text-foreground font-medium">{subItemName}</span>
+                  </p>
+                )}
                 <p>
-                  Provider: <span className="text-foreground font-medium">{provider?.name}</span>
+                  Provider: <span className="text-foreground font-medium">{(provider as any)?.full_name ?? (provider as any)?.name}</span>
                 </p>
                 <p>
                   Date: <span className="text-foreground font-medium">{selectedDate ? format(selectedDate, "EEEE, d MMMM yyyy") : "-"}</span>
